@@ -1,0 +1,178 @@
+import os, time, base64, json
+from pathlib import Path
+from typing import Any
+from flask import Flask, render_template, request, jsonify, session
+import requests
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, ed25519, rsa
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "CHANGE-ME-before-deploy")
+# Demo is the default. Live trading requires BOTH environment flags.
+MODE = os.environ.get("KALSHI_MODE", "demo").lower()
+LIVE_ENABLED = os.environ.get("LIVE_TRADING_ENABLED", "false").lower() == "true"
+BASE_URL = ("https://api.elections.kalshi.com/trade-api/v2"
+            if MODE == "live" else "https://demo-api.kalshi.co/trade-api/v2")
+
+# Store credentials server-side in environment variables only.
+KEY_ID = os.environ.get("KALSHI_API_KEY_ID", "")
+PRIVATE_KEY_PATH = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "")
+PRIVATE_KEY_PEM = os.environ.get("KALSHI_PRIVATE_KEY_PEM", "")
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "KalshiEdge/0.2"})
+
+def load_private_key():
+    if PRIVATE_KEY_PATH:
+        pem = Path(PRIVATE_KEY_PATH).read_bytes()
+    elif PRIVATE_KEY_PEM:
+        pem = PRIVATE_KEY_PEM.replace("\\n", "\n").encode()
+    else:
+        return None
+    return serialization.load_pem_private_key(pem, password=None)
+
+def signed_headers(method: str, path: str) -> dict[str, str]:
+    key = load_private_key()
+    if not key or not KEY_ID:
+        raise RuntimeError("Server API credentials are not configured.")
+    timestamp = str(int(time.time() * 1000))
+    # Kalshi signs timestamp + uppercase method + API path, without query parameters.
+    path_to_sign = path.split("?", 1)[0]
+    message = f"{timestamp}{method.upper()}{path_to_sign}".encode()
+    if isinstance(key, ed25519.Ed25519PrivateKey):
+        signature = key.sign(message)
+    elif isinstance(key, rsa.RSAPrivateKey):
+        signature = key.sign(
+            message,
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()),
+                        salt_length=hashes.SHA256().digest_size),
+            hashes.SHA256()
+        )
+    else:
+        raise RuntimeError("Unsupported key type. Use a Kalshi RSA or Ed25519 private key.")
+    return {
+        "KALSHI-ACCESS-KEY": KEY_ID,
+        "KALSHI-ACCESS-TIMESTAMP": timestamp,
+        "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode(),
+        "Content-Type": "application/json"
+    }
+
+def api_request(method: str, path: str, params=None, body=None):
+    headers = signed_headers(method, "/trade-api/v2" + path)
+    response = SESSION.request(
+        method, BASE_URL + path, params=params, json=body, headers=headers, timeout=20
+    )
+    if response.status_code >= 400:
+        # Do not expose credential values; API error text may be useful for debugging.
+        raise RuntimeError(f"Kalshi API returned HTTP {response.status_code}: {response.text[:500]}")
+    return response.json() if response.text else {}
+
+def public_request(path: str, params=None):
+    response = SESSION.get(BASE_URL + path, params=params, timeout=15)
+    response.raise_for_status()
+    return response.json()
+
+@app.after_request
+def security_headers(resp):
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+@app.route("/")
+def index():
+    return render_template("index.html", mode=MODE, live_enabled=LIVE_ENABLED)
+
+@app.get("/api/status")
+def status():
+    configured = bool(KEY_ID and (PRIVATE_KEY_PATH or PRIVATE_KEY_PEM))
+    return jsonify({
+        "mode": MODE,
+        "live_enabled": LIVE_ENABLED,
+        "credentials_configured": configured,
+        "connected": False,
+        "message": "Credentials are configured on the server; click Connect to test them."
+    })
+
+@app.post("/api/connect")
+def connect():
+    try:
+        data = api_request("GET", "/portfolio/balance")
+        return jsonify({"ok": True, "balance": data, "mode": MODE})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+@app.get("/api/markets")
+def markets():
+    try:
+        data = public_request("/markets", {"status": "open", "limit": 100})
+        return jsonify({"markets": data.get("markets", [])})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 502
+
+@app.get("/api/portfolio")
+def portfolio():
+    try:
+        balance = api_request("GET", "/portfolio/balance")
+        positions = api_request("GET", "/portfolio/positions", {"limit": 100})
+        orders = api_request("GET", "/portfolio/orders", {"status": "resting", "limit": 100})
+        return jsonify({"balance": balance, "positions": positions, "orders": orders, "mode": MODE})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+@app.post("/api/order")
+def create_order():
+    body = request.get_json(silent=True) or {}
+    # Server-side guard: live trading cannot be enabled from the browser.
+    if MODE == "live" and not LIVE_ENABLED:
+        return jsonify({"error": "Live trading is disabled on the server. Set LIVE_TRADING_ENABLED=true only after testing demo mode."}), 403
+    if body.get("confirm_live") is not True and MODE == "live":
+        return jsonify({"error": "Explicit live-order confirmation is required."}), 400
+
+    ticker = str(body.get("ticker", "")).strip()
+    side = str(body.get("side", "")).lower()
+    price = body.get("price")
+    count = body.get("count")
+    if not ticker or side not in ("yes", "no"):
+        return jsonify({"error": "Provide a valid market ticker and side (yes/no)."}), 400
+    try:
+        price = int(price)
+        count = int(count)
+    except (TypeError, ValueError):
+        return jsonify({"error": "Price must be cents and count must be an integer."}), 400
+    if not (1 <= price <= 99 and 1 <= count <= 10):
+        return jsonify({"error": "Price must be 1–99 cents and order size must be 1–10 contracts per order."}), 400
+
+    # Always limit order; never submit market orders. Browser is not allowed to set arbitrary fields.
+    order = {
+        "ticker": ticker,
+        "action": "buy",
+        "side": side,
+        "count": count,
+        "type": "limit",
+        "client_order_id": f"kalshi-edge-{int(time.time()*1000)}",
+        "yes_price" if side == "yes" else "no_price": price
+    }
+    try:
+        result = api_request("POST", "/portfolio/orders", body=order)
+        return jsonify({"ok": True, "result": result, "mode": MODE})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+@app.post("/api/cancel")
+def cancel_order():
+    if MODE == "live" and not LIVE_ENABLED:
+        return jsonify({"error": "Live trading is disabled on the server."}), 403
+    body = request.get_json(silent=True) or {}
+    order_id = str(body.get("order_id", "")).strip()
+    if not order_id:
+        return jsonify({"error": "Missing order_id."}), 400
+    try:
+        result = api_request("DELETE", f"/portfolio/orders/{order_id}")
+        return jsonify({"ok": True, "result": result})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+if __name__ == "__main__":
+    # Local development only; do not expose Flask's development server to the internet.
+    app.run(host="127.0.0.1", port=8080, debug=False)
